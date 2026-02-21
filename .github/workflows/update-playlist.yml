@@ -1,9 +1,11 @@
 name: Update IPTV Playlist
 
 on:
-  # Run automatically every 6 hours
+  # Run automatically every hour
   schedule:
-    - cron: '0 * * * *'
+    - cron: '0 * * * *'  # Every hour (fast checks)
+    # Uncomment below for more frequent checks:
+    # - cron: '*/15 * * * *'  # Every 15 minutes (very frequent)
   
   # Allow manual trigger
   workflow_dispatch:
@@ -34,12 +36,17 @@ jobs:
       
       - name: Run playlist updater
         id: update
-        env:
-          UPSTREAM_URL_1: ${{ secrets.UPSTREAM_URL_1 }}
-          UPSTREAM_URL_2: ${{ secrets.UPSTREAM_URL_2 }}
-          UPSTREAM_URL_3: ${{ secrets.UPSTREAM_URL_3 }}
         run: |
           echo "Running playlist updater..."
+          
+          # Load upstream URLs from .env file
+          if [ -f ".env" ]; then
+            export $(cat .env | grep -v '^#' | xargs)
+            echo "✓ Loaded upstream URLs from .env"
+          else
+            echo "✗ .env file not found"
+            exit 1
+          fi
           
           # Determine validation flag
           VALIDATE_FLAG=""
@@ -58,6 +65,11 @@ jobs:
               "$UPSTREAM_URL_1" \
               "$UPSTREAM_URL_2" \
               "$UPSTREAM_URL_3" \
+              "$UPSTREAM_URL_4" \
+              "$UPSTREAM_URL_5" \
+              "$UPSTREAM_URL_6" \
+              "$UPSTREAM_URL_7" \
+              "$UPSTREAM_URL_8" \
             $VALIDATE_FLAG
           
           # Capture exit code

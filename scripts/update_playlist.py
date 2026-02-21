@@ -12,6 +12,7 @@ import ssl
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 @dataclass
@@ -26,6 +27,7 @@ class Channel:
     channel_name: str = ""  # Name after comma in EXTINF
     is_commented: bool = False
     raw_lines: List[str] = field(default_factory=list)  # Original lines including comments
+    source_rank: int = 999  # Upstream priority: 0 = highest, assigned during loading
     
     def __post_init__(self):
         """Extract metadata from EXTINF line"""
@@ -230,6 +232,33 @@ class PlaylistUpdater:
             except:
                 return False
     
+    def validate_urls_concurrent(self, channels: List[Channel]) -> Dict[str, bool]:
+        """Validate multiple URLs concurrently for better performance"""
+        print(f"  Validating {len(channels)} URLs concurrently...")
+        results = {}
+        
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_channel = {
+                executor.submit(self.validate_stream_url, ch.url): ch 
+                for ch in channels if ch.url
+            }
+            
+            completed = 0
+            for future in as_completed(future_to_channel):
+                channel = future_to_channel[future]
+                try:
+                    is_working = future.result()
+                    results[channel.url] = is_working
+                    completed += 1
+                    if completed % 10 == 0:
+                        print(f"    Progress: {completed}/{len(channels)}")
+                except Exception as e:
+                    results[channel.url] = False
+        
+        working_count = sum(1 for v in results.values() if v)
+        print(f"  ✓ {working_count}/{len(channels)} URLs are working")
+        return results
+    
     def load_curated_playlist(self) -> List[Channel]:
         """Load and parse the curated playlist"""
         print(f"\nLoading curated playlist: {self.curated_playlist_path}")
@@ -248,22 +277,29 @@ class PlaylistUpdater:
         print("\n=== Loading Upstream Playlists ===")
         upstream_map = {}  # key -> list of channels
         
-        for url in self.upstream_urls:
+        # Enumerate to track priority (index 0 = highest priority)
+        for rank, url in enumerate(self.upstream_urls):
             content = self.fetch_url(url)
             if not content:
                 continue
             
             channels = M3UParser.parse(content)
-            print(f"Parsed {len(channels)} channels from upstream")
+            print(f"Parsed {len(channels)} channels from upstream (priority rank: {rank})")
             
             # Add to map (collect ALL matches, not just latest)
             for channel in channels:
                 if not channel.url:  # Skip channels without URLs
                     continue
+                # Assign source rank for priority tracking
+                channel.source_rank = rank
                 key = channel.get_match_key()
                 if key not in upstream_map:
                     upstream_map[key] = []
                 upstream_map[key].append(channel)
+        
+        # Sort each channel list by source_rank to ensure deterministic priority ordering
+        for key in upstream_map:
+            upstream_map[key].sort(key=lambda c: c.source_rank)
         
         total_channels = sum(len(v) for v in upstream_map.values())
         print(f"\n✓ Total upstream channel entries: {total_channels} ({len(upstream_map)} unique names)")
@@ -274,6 +310,15 @@ class PlaylistUpdater:
                        validate_urls: bool = False) -> Tuple[List[Channel], int]:
         """Update curated channels with upstream URLs"""
         print("\n=== Updating Channels ===")
+        
+        # If validating, pre-validate all upstream URLs concurrently
+        url_validation_cache = {}
+        if validate_urls:
+            all_upstream_channels = []
+            for channels_list in upstream_map.values():
+                all_upstream_channels.extend(channels_list)
+            url_validation_cache = self.validate_urls_concurrent(all_upstream_channels)
+        
         updated_count = 0
         added_count = 0
         backup_added_count = 0
@@ -303,19 +348,20 @@ class PlaylistUpdater:
             if key in upstream_map:
                 upstream_channels = upstream_map[key]
                 
-                # Find best URL (first working one if validating, otherwise first one)
+                # Find best URL (prioritize by source_rank, then by validation if enabled)
+                # upstream_channels is already sorted by source_rank (lowest first)
                 best_upstream = None
                 if validate_urls:
-                    # Try to find a working URL
+                    # Use pre-validated results, prefer lowest source_rank among working URLs
                     for upstream_channel in upstream_channels:
-                        if self.validate_stream_url(upstream_channel.url):
+                        if url_validation_cache.get(upstream_channel.url, False):
                             best_upstream = upstream_channel
                             break
                     if not best_upstream and upstream_channels:
-                        # No working URL found, use first one anyway
+                        # No working URL found, fall back to highest-priority (lowest rank) entry
                         best_upstream = upstream_channels[0]
                 else:
-                    # No validation, just use first alternative
+                    # No validation, use highest-priority upstream (first in sorted list)
                     best_upstream = upstream_channels[0] if upstream_channels else None
                 
                 if not best_upstream:
@@ -383,21 +429,34 @@ class PlaylistUpdater:
             if not is_backup and key in upstream_map and len(upstream_map[key]) > 1:
                 # Check if we already have backup channels for this
                 base_name = channel.channel_name
-                existing_backups = [c for c in curated_channels if base_name in c.channel_name and c.channel_name != base_name]
+                # Look for existing backups in curated list (check for "Backup" variations)
+                existing_backup_names = [
+                    c.channel_name for c in curated_channels 
+                    if base_name.lower() in c.channel_name.lower() 
+                    and any(marker in c.channel_name for marker in ['Backup', 'backup', '-[2]', '-[3]', '(2)', '(3)'])
+                ]
                 
-                # Only create backups if we don't have any yet and there are good alternatives
-                if len(existing_backups) == 0 and len(upstream_map[key]) >= 2:
-                    # Add one backup channel (using second alternative)
-                    backup_channel = Channel(
-                        extinf_line=channel.extinf_line.replace(f',{base_name}', f',{base_name} (Backup)'),
-                        url=upstream_map[key][1].url,
-                        is_commented=False,
-                        raw_lines=[]
-                    )
-                    print(f"  ➕ Adding backup: {base_name} (Backup)")
-                    print(f"     URL: {backup_channel.url[:70]}...")
-                    updated_channels.append(backup_channel)
-                    backup_added_count += 1
+                # Determine how many backups to create (max 2, based on available upstreams)
+                available_alternatives = upstream_map[key][1:]  # Skip first (primary)
+                max_backups = min(2, len(available_alternatives))
+                
+                # Create backups only if we don't have existing ones
+                if len(existing_backup_names) == 0 and max_backups > 0:
+                    for backup_idx in range(max_backups):
+                        backup_num = backup_idx + 1
+                        backup_suffix = f" (Backup {backup_num})" if backup_num > 1 else " (Backup)"
+                        
+                        backup_channel = Channel(
+                            extinf_line=channel.extinf_line.replace(f',{base_name}', f',{base_name}{backup_suffix}'),
+                            url=available_alternatives[backup_idx].url,
+                            is_commented=False,
+                            raw_lines=[],
+                            source_rank=available_alternatives[backup_idx].source_rank
+                        )
+                        print(f"  ➕ Adding backup: {base_name}{backup_suffix} (from upstream rank {backup_channel.source_rank})")
+                        print(f"     URL: {backup_channel.url[:70]}...")
+                        updated_channels.append(backup_channel)
+                        backup_added_count += 1
         
         print(f"\n✓ Kept {len(updated_channels)} channels ({added_count} URLs added, {updated_count} URLs updated, {backup_added_count} backups created)")
         return updated_channels, updated_count + added_count + backup_added_count
