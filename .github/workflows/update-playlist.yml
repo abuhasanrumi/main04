@@ -1,13 +1,8 @@
 name: Update IPTV Playlist
 
 on:
-  # Run automatically every hour
   schedule:
-    - cron: '0 * * * *'  # Every hour (fast checks)
-    # Uncomment below for more frequent checks:
-    # - cron: '*/15 * * * *'  # Every 15 minutes (very frequent)
-  
-  # Allow manual trigger
+    - cron: '0 * * * *'
   workflow_dispatch:
     inputs:
       validate_urls:
@@ -19,22 +14,22 @@ on:
 jobs:
   update:
     runs-on: ubuntu-latest
-    environment: .env  # Use the .env environment for variables
-    
+    environment: .env
+
     permissions:
       contents: write
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
-      
+          fetch-depth: 0   # IMPORTANT: allow rebase/merge on latest main
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      
+
       - name: Run playlist updater
         id: update
         env:
@@ -49,8 +44,7 @@ jobs:
         run: |
           echo "Running playlist updater..."
           echo "✓ Loaded upstream URLs from encrypted secrets"
-          
-          # Determine validation flag
+
           VALIDATE_FLAG=""
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.validate_urls }}" = "true" ]; then
             VALIDATE_FLAG="--validate"
@@ -59,8 +53,7 @@ jobs:
             VALIDATE_FLAG="--no-validate"
             echo "URL validation: DISABLED (use manual trigger to enable)"
           fi
-          
-          # Run the updater
+
           python scripts/update_playlist.py \
             --playlist my \
             --upstream \
@@ -73,11 +66,10 @@ jobs:
               "$UPSTREAM_URL_7" \
               "$UPSTREAM_URL_8" \
             $VALIDATE_FLAG
-          
-          # Capture exit code
+
           UPDATE_EXIT_CODE=$?
           echo "exit_code=$UPDATE_EXIT_CODE" >> $GITHUB_OUTPUT
-          
+
           if [ $UPDATE_EXIT_CODE -eq 0 ]; then
             echo "✓ Playlist updated successfully"
             echo "has_changes=true" >> $GITHUB_OUTPUT
@@ -85,50 +77,83 @@ jobs:
             echo "ℹ No changes detected"
             echo "has_changes=false" >> $GITHUB_OUTPUT
           fi
-      
+
       - name: Check for changes
         id: git_status
         run: |
           git diff --exit-code my || echo "changes_detected=true" >> $GITHUB_OUTPUT
-      
+
       - name: Commit and push changes
         if: steps.git_status.outputs.changes_detected == 'true'
         run: |
+          set -euo pipefail
+
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
-          
-          # Get current date for commit message
+
           CURRENT_DATE=$(date -u +"%Y-%m-%d %H:%M UTC")
-          
-          # Add and commit
+
           git add my
           git commit -m "🔄 Auto-update playlist - $CURRENT_DATE" \
                      -m "Updated by GitHub Actions" \
-                     -m "Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          
-          # Push changes
-          git push
-          
-          echo "✓ Changes committed and pushed"
-      
+                     -m "Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" || true
+
+          # If commit produced nothing (rare edge), exit cleanly
+          if git diff --cached --quiet && git diff --quiet; then
+            echo "ℹ Nothing to push"
+            exit 0
+          fi
+
+          # Push with retry to handle concurrent workflow runs
+          for i in 1 2 3 4 5; do
+            echo "↻ Sync attempt $i/5"
+
+            # Refresh remote main
+            git fetch origin main
+
+            # Rebase our local commit(s) on top of latest main
+            if ! git rebase origin/main; then
+              git rebase --abort || true
+              # If something weird happened, re-apply our staged state safely
+              git reset --soft HEAD~1 || true
+              git add my
+              git commit -m "🔄 Auto-update playlist - $CURRENT_DATE" \
+                         -m "Updated by GitHub Actions" \
+                         -m "Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" || true
+              git rebase origin/main
+            fi
+
+            # Try pushing
+            if git push origin HEAD:main; then
+              echo "✓ Changes committed and pushed"
+              exit 0
+            fi
+
+            echo "⚠ Push rejected (someone pushed first). Retrying..."
+            sleep 2
+          done
+
+          echo "✗ Push failed after retries"
+          exit 1
+
       - name: Summary
         if: always()
         run: |
           echo "## IPTV Playlist Update Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          
+
           if [ "${{ steps.git_status.outputs.changes_detected }}" = "true" ]; then
             echo "✅ **Playlist updated and committed**" >> $GITHUB_STEP_SUMMARY
           else
             echo "ℹ️ **No changes detected - playlist is up to date**" >> $GITHUB_STEP_SUMMARY
           fi
-          
+
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Details" >> $GITHUB_STEP_SUMMARY
           echo "- Trigger: \`${{ github.event_name }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- Branch: \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- Commit: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
-          
+
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "- URL Validation: \`${{ inputs.validate_urls }}\`" >> $GITHUB_STEP_SUMMARY
           fi
