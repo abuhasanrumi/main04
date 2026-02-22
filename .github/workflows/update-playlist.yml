@@ -6,10 +6,10 @@ on:
   workflow_dispatch:
     inputs:
       validate_urls:
-        description: 'Validate stream URLs (slower)'
+        description: 'Validate stream URLs (default: true). Turn off for faster run.'
         required: false
         type: boolean
-        default: false
+        default: true
 
 jobs:
   update:
@@ -23,7 +23,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # IMPORTANT: allow rebase/merge on latest main
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -42,30 +42,47 @@ jobs:
           UPSTREAM_URL_7: ${{ secrets.UPSTREAM_URL_7 }}
           UPSTREAM_URL_8: ${{ secrets.UPSTREAM_URL_8 }}
         run: |
+          set -euo pipefail
+
           echo "Running playlist updater..."
           echo "✓ Loaded upstream URLs from encrypted secrets"
 
-          VALIDATE_FLAG=""
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.validate_urls }}" = "true" ]; then
-            VALIDATE_FLAG="--validate"
-            echo "URL validation: ENABLED"
-          else
+          # ----------------------------
+          # Validation: DEFAULT ON
+          # - schedule runs: always validate
+          # - manual runs: validate unless user turns it off
+          # ----------------------------
+          VALIDATE_FLAG="--validate"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.validate_urls }}" != "true" ]; then
             VALIDATE_FLAG="--no-validate"
-            echo "URL validation: DISABLED (use manual trigger to enable)"
+          fi
+          echo "URL validation flag: ${VALIDATE_FLAG}"
+
+          # ----------------------------
+          # Upstreams: easy enable/disable
+          # Comment out any line you don't want
+          # ----------------------------
+          UPSTREAM_ARGS=()
+
+          [ -n "${UPSTREAM_URL_1}" ] && UPSTREAM_ARGS+=("${UPSTREAM_URL_1}")
+          [ -n "${UPSTREAM_URL_2}" ] && UPSTREAM_ARGS+=("${UPSTREAM_URL_2}")
+          [ -n "${UPSTREAM_URL_3}" ] && UPSTREAM_ARGS+=("${UPSTREAM_URL_3}")
+          # [ -n "${UPSTREAM_URL_4}" ] && UPSTREAM_ARGS+=("${UPSTREAM_URL_4}")
+          [ -n "${UPSTREAM_URL_5}" ] && UPSTREAM_ARGS+=("${UPSTREAM_URL_5}")
+          # [ -n "${UPSTREAM_URL_6}" ] && UPSTREAM_ARGS+=("${UPSTREAM_URL_6}")
+          [ -n "${UPSTREAM_URL_7}" ] && UPSTREAM_ARGS+=("${UPSTREAM_URL_7}")
+          # [ -n "${UPSTREAM_URL_8}" ] && UPSTREAM_ARGS+=("${UPSTREAM_URL_8}")
+
+          echo "Upstreams enabled: ${#UPSTREAM_ARGS[@]}"
+          if [ ${#UPSTREAM_ARGS[@]} -eq 0 ]; then
+            echo "✗ No upstream URLs enabled (check secrets or commented lines)"
+            exit 1
           fi
 
           python scripts/update_playlist.py \
             --playlist my \
-            --upstream \
-              "$UPSTREAM_URL_1" \
-              "$UPSTREAM_URL_2" \
-              "$UPSTREAM_URL_3" \
-              "$UPSTREAM_URL_4" \
-              "$UPSTREAM_URL_5" \
-              "$UPSTREAM_URL_6" \
-              "$UPSTREAM_URL_7" \
-              "$UPSTREAM_URL_8" \
-            $VALIDATE_FLAG
+            --upstream "${UPSTREAM_ARGS[@]}" \
+            ${VALIDATE_FLAG}
 
           UPDATE_EXIT_CODE=$?
           echo "exit_code=$UPDATE_EXIT_CODE" >> $GITHUB_OUTPUT
@@ -98,23 +115,18 @@ jobs:
                      -m "Updated by GitHub Actions" \
                      -m "Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" || true
 
-          # If commit produced nothing (rare edge), exit cleanly
           if git diff --cached --quiet && git diff --quiet; then
             echo "ℹ Nothing to push"
             exit 0
           fi
 
-          # Push with retry to handle concurrent workflow runs
           for i in 1 2 3 4 5; do
             echo "↻ Sync attempt $i/5"
 
-            # Refresh remote main
             git fetch origin main
 
-            # Rebase our local commit(s) on top of latest main
             if ! git rebase origin/main; then
               git rebase --abort || true
-              # If something weird happened, re-apply our staged state safely
               git reset --soft HEAD~1 || true
               git add my
               git commit -m "🔄 Auto-update playlist - $CURRENT_DATE" \
@@ -123,7 +135,6 @@ jobs:
               git rebase origin/main
             fi
 
-            # Try pushing
             if git push origin HEAD:main; then
               echo "✓ Changes committed and pushed"
               exit 0
@@ -156,4 +167,6 @@ jobs:
 
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "- URL Validation: \`${{ inputs.validate_urls }}\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- URL Validation: \`true\`" >> $GITHUB_STEP_SUMMARY
           fi
