@@ -229,10 +229,17 @@ class Channel:
         lines.append(self.extinf_line)
 
         if self.url:
+            normalized_url = re.sub(
+                r'(?:\s*#\s*disabled:\s*unreachable)+',
+                ' # disabled: unreachable',
+                self.url,
+                flags=re.IGNORECASE,
+            ).strip()
+
             if self.is_commented:
-                lines.append(f"#{self.url}")
+                lines.append(f"#{normalized_url.lstrip('#')}")
             else:
-                lines.append(self.url)
+                lines.append(normalized_url)
 
         return lines
 
@@ -337,8 +344,24 @@ class PlaylistUpdater:
             print(f"✗ Failed to fetch {url}: {e}")
             return None
 
+    @staticmethod
+    def strip_inline_markers(url: str) -> str:
+        """Return a clean URL without leading # or inline annotations."""
+        if not url:
+            return ""
+
+        cleaned = url.strip()
+        if cleaned.startswith('#'):
+            cleaned = cleaned[1:].strip()
+
+        # Remove any inline comments like " # disabled: unreachable" or " # LOCK"
+        cleaned = re.split(r'\s+#', cleaned, maxsplit=1)[0].strip()
+        return cleaned
+
     def validate_stream_url(self, url: str) -> bool:
-        if not url or url.startswith('#'):
+        url = self.strip_inline_markers(url)
+
+        if not url:
             return False
 
         try:
@@ -537,6 +560,8 @@ class PlaylistUpdater:
             best_upstream = self._pick_best_upstream(channel, candidates, url_validation_cache, validate_urls)
 
             if best_upstream:
+                current_url_clean = self.strip_inline_markers(channel.url)
+
                 # If channel has no URL, add
                 if not channel.url:
                     print(f"✓ Adding URL: {channel.display_name()}")
@@ -548,7 +573,7 @@ class PlaylistUpdater:
                     added_count += 1
 
                 # Update if different and not locked
-                elif channel.url != best_upstream.url:
+                elif current_url_clean != self.strip_inline_markers(best_upstream.url):
                     if not self.is_locked_disabled(channel):
                         print(f"↻ Updating: {channel.display_name()}")
                         print(f"  Old: {channel.url[:80]}...")
@@ -574,7 +599,11 @@ class PlaylistUpdater:
                     print(f"⚠ Unreachable: {channel.display_name()}")
 
                     # try alternatives among candidates (skip current)
-                    alts = [c for c in candidates if c.url and c.url != channel.url]
+                    current_url_clean = self.strip_inline_markers(channel.url)
+                    alts = [
+                        c for c in candidates
+                        if c.url and self.strip_inline_markers(c.url) != current_url_clean
+                    ]
                     alts_sorted = sorted(
                         alts,
                         key=lambda u: (
@@ -598,7 +627,11 @@ class PlaylistUpdater:
                     if not switched:
                         print(f"    ✗ No working alternatives found")
                         channel.is_commented = True
-                        channel.url += " # disabled: unreachable"
+                        current_url_clean = self.strip_inline_markers(channel.url)
+                        if current_url_clean:
+                            channel.url = f"{current_url_clean} # disabled: unreachable"
+                        else:
+                            channel.url = ""
 
             updated_channels.append(channel)
 
